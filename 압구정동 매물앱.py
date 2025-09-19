@@ -409,6 +409,7 @@ def run_query_and_store(out_df):
 if st.session_state.mode == "price_sale":
     st.subheader("💰 금액대별 검색 (매매)")
     st.caption("최소금액과 최대금액을 (억) 단위로 선택하시고 조회버튼을 눌러주세요")
+    st.caption("매물검색 후 ‘조회’를 누르면 하단에 검색결과가 표시됩니다.")
 
     v = pd.to_numeric(data["금액(억)"], errors="coerce").dropna()
     min_eok, max_eok = (0.0, 100.0) if v.empty else (float(np.floor(v.min())), float(np.ceil(v.max())))
@@ -631,5 +632,6 @@ with cback2:
     if st.button("⬅ 처음으로", use_container_width=True):
         reset_all()
         st.rerun()
+
 
 
