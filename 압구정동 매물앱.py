@@ -17,6 +17,15 @@ st.set_page_config(
     page_icon="assets/thumbnail.png",   # ← 이미지 파일을 아이콘으로
     layout="wide"
 )
+# 썸네일 강제 생성용: URL에 ?thumb=1 로 접속하면 이미지만 보여주고 종료
+from urllib.parse import parse_qs, urlparse
+import streamlit as st
+
+qs = st.query_params  # Streamlit 1.32+ (1.29 이하는: st.experimental_get_query_params())
+if qs.get("thumb") == "1":
+    st.image("thumbnail.png", use_container_width=True)  # 레포 루트에 thumbnail.png
+    st.stop()
+
 
 # 타이틀 아래에 배너 이미지 표시 (선택)
 st.title("🏠 허위매물없는 압구정동 매매 · 임대 실시간 검색")
@@ -632,6 +641,7 @@ with cback2:
     if st.button("⬅ 처음으로", use_container_width=True):
         reset_all()
         st.rerun()
+
 
 
 
