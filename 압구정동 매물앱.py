@@ -19,7 +19,6 @@ st.set_page_config(
 )
 
 # 타이틀 아래에 배너 이미지 표시 (선택)
-st.image("thumbnail.png", use_container_width=True)
 st.title("🏠 허위매물없는 압구정동 매매 · 임대 실시간 검색")
 
 # ===== 앱 설정 및 시트 정보 =====
@@ -632,4 +631,5 @@ with cback2:
     if st.button("⬅ 처음으로", use_container_width=True):
         reset_all()
         st.rerun()
+
 
