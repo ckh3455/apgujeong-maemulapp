@@ -369,6 +369,28 @@ if st.session_state.dataset is None:
         if st.button("🧾 임대물건 검색", use_container_width=True):
             to_dataset("rent")
             st.rerun()
+    # --- [추가] 모바일에서도 보이는 업소 홍보 문구 (버튼 아래) ---
+    st.markdown(
+        """
+        <div style="
+            margin-top:14px;
+            padding:12px 16px;
+            border-radius:12px;
+            background:rgba(255,75,75,0.06);
+            text-align:center;
+            line-height:1.45;
+            font-size:15px;
+        ">
+            <b>🏢 압구정 원 부동산중개</b><br/>
+            허위매물 없는 실매물/임대 실시간 업데이트<br/>
+            가격 변동·거래 발생 시 즉시 문자 알림<br/>
+            <span style="opacity:.9;">대표번호</span> <b>02-540-3334</b> ·
+            <span style="opacity:.9;">모바일(최이사)</span> <b>010-3065-1780</b>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+  
     st.stop()
 else:
     st.button("⬅ 처음으로", on_click=reset_all)
@@ -641,6 +663,7 @@ with cback2:
     if st.button("⬅ 처음으로", use_container_width=True):
         reset_all()
         st.rerun()
+
 
 
 
