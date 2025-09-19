@@ -1,0 +1,589 @@
+# 압구정동_매물앱_단계형.py
+# 실행: streamlit run "압구정동_매물앱_단계형.py"
+
+import os, re, time
+import numpy as np
+import pandas as pd
+import streamlit as st
+from datetime import datetime
+from urllib.parse import quote
+
+st.set_page_config(page_title="압구정동 실매물 · 임대 실시간 검색 (단계형)", page_icon="🏠", layout="wide")
+st.title("🏠 압구정동 실매물 · 임대 실시간 검색 (단계형)")
+
+# ─────────────────────────────────────────────────────────
+# 0) 데이터 소스 (구글시트 by sheet name)
+# ─────────────────────────────────────────────────────────
+SHEET_ID = "1QP56lm5kPBdsUhrgcgY2U-JdmukXIkKCSxefd1QExKE"
+CSV_BASE = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv"
+
+SALE_SHEET_NAME = "매매물건 목록"
+RENT_SHEET_NAME = "임대물건 목록"
+
+# (선택) 로컬 엑셀 테스트 시 경로 입력 (비워두면 무시)
+EXCEL_PATH = ""  # 예) r"D:\OneDrive\office work\00 압구정동 실시간 매물앱\원부동산 매물장.xlsx"
+
+# ─────────────────────────────────────────────────────────
+# 1) 유틸
+# ─────────────────────────────────────────────────────────
+def parse_first_number(val):
+    s = str(val)
+    if s.strip() == "" or s.lower() == "nan":
+        return float('nan')
+    m = re.findall(r"\d+\.?\d*", s.replace(",", ""))
+    return float(m[0]) if m else float('nan')
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """시트 컬럼 변경에도 견딜 수 있게 기본 별칭 매핑 (평형대는 있는 그대로 사용)."""
+    df = df.copy()
+    df.columns = (df.columns.astype(str)
+                  .str.replace('\u00a0', ' ', regex=False)  # NBSP
+                  .str.replace('\ufeff', '', regex=False)   # BOM
+                  .str.strip())
+    alias, cols = {}, df.columns.tolist()
+
+    for c in cols:
+        c0 = c.strip()
+        lc = c0.lower()
+
+        # 공통
+        if "공개" in c0: alias[c0] = "공개여부"
+        if any(k in c0 for k in ["요약","특징","메모","비고"]) or ("요역" in c0):  # 오타 요역내용 교정
+            alias[c0] = "요약내용"
+        if c0 in ["층/호","층호","층수"] and "층" not in cols:
+            alias[c0] = "층"
+        if "구역" in c0 and "구역" not in cols:
+            alias[c0] = "구역"
+        if c0 in ["동호수"] and "동" not in cols:
+            alias[c0] = "동"
+
+        # 매매 금액(만원) 계열 → 가격(만원)
+        if (("매매" in c0 or "가격" in c0) and "만원" in c0) and "가격(만원)" not in alias.values():
+            alias[c0] = "가격(만원)"
+
+        # 임대 전세금(=금액(억)) 별칭
+        if any(k in c0 for k in ["전세금","전세가","전세"]) and ("억" in c0):
+            alias[c0] = "금액(억)"
+        if c0 in ["가격(억)","임대금액(억)","전세(억)"]:
+            alias[c0] = "금액(억)"
+
+        # 임대 보증금/월세 (만원/억 혼재 대응)
+        if "보증금" in c0 and "억" in c0:
+            alias[c0] = "보증금(억)"
+        if "보증금" in c0 and ("만" in c0 or "만원" in c0):
+            alias[c0] = "보증금(만원)"
+        if ("월세" in c0) and (("만" in c0) or ("만원" in c0) or c0 == "월세"):
+            alias[c0] = "월세(만)"
+
+        # 평형대 컬럼(문자열)은 있는 그대로 사용하므로 별칭만 최소화
+        if "평형대" in c0.replace(" ", "") and "평형대" not in df.columns:
+            alias[c0] = "평형대"
+
+        # 평형(문자열) 별칭
+        if "평형" not in cols and c0.replace(" ", "") in ["평형(평)","평수","전용(평)","전용평","전용면적(평)"]:
+            alias[c0] = "평형"
+        elif "평형" not in cols and ("평" in c0.replace(" ", "")) and ("평형대" not in c0) and ("평당" not in c0) and ("가격" not in c0):
+            alias[c0] = "평형"
+
+    if alias:
+        df = df.rename(columns=alias)
+
+    # 필수 텍스트 컬럼 보강
+    for c in ["구역","동","층","요약내용","평형","평형대"]:
+        if c not in df.columns:
+            df[c] = ""
+
+    return df
+
+# ─────────────────────────────────────────────────────────
+# 2) 전처리 (매매/임대)  — 평형대는 시트 값을 그대로 신뢰
+# ─────────────────────────────────────────────────────────
+def enrich_sale(df: pd.DataFrame) -> pd.DataFrame:
+    df = normalize_columns(df)
+
+    # 금액(억)
+    price_col = next((c for c in ["매매가(만원)","가격(만원)","매매(만원)","거래금액(만원)","금액(만원)"] if c in df.columns), None)
+    if "금액(억)" in df.columns:
+        df["금액(억)"] = pd.to_numeric(df["금액(억)"].apply(parse_first_number), errors="coerce")
+    elif price_col:
+        df[price_col] = df[price_col].apply(parse_first_number)
+        df["금액(억)"] = (df[price_col]/10000).round(1)
+    else:
+        df["금액(억)"] = np.nan
+
+    # 평형/평형대 표준화(공백 제거)
+    df["평형"] = df["평형"].astype(str).str.strip()
+    df["평형대"] = df["평형대"].astype(str).str.replace(" ", "").str.strip()
+
+    # 구역 정리
+    def normalize_zone(z):
+        s = str(z).strip()
+        if s == "" or s.lower() == "nan": return ""
+        if s.isdigit(): return f"{int(s)}구역"
+        m = re.match(r"(\d+)\s*구역", s)
+        return f"{int(m.group(1))}구역" if m else s
+    df["구역"] = df["구역"].apply(normalize_zone)
+
+    # 동 숫자화 시도
+    try:
+        df["동"] = df["동"].apply(lambda x: str(int(float(str(x)))) if str(x).replace('.','',1).isdigit() else str(x))
+    except Exception:
+        df["동"] = df["동"].astype(str)
+
+    # 공개여부
+    if "공개여부" in df.columns:
+        df["공개여부_norm"] = df["공개여부"].astype(str).str.strip().str.lower().map(
+            {"y":"y","yes":"y","true":"y","1":"y","공개":"y"}).fillna("n")
+    else:
+        df["공개여부_norm"] = "y"
+
+    # 요약 기본값
+    df["요약내용"] = df["요약내용"].fillna("").apply(lambda x: "상태 보통" if str(x).strip()=="" else x)
+    return df
+
+def enrich_rent(df: pd.DataFrame) -> pd.DataFrame:
+    df = normalize_columns(df)
+
+    # 전세: 금액(억)
+    if "금액(억)" in df.columns:
+        df["금액(억)"] = pd.to_numeric(df["금액(억)"].apply(parse_first_number), errors="coerce")
+    else:
+        won_cols = [c for c in df.columns if ("금액" in c and "만원" in c)]
+        if won_cols:
+            base = won_cols[0]
+            df["금액(억)"] = pd.to_numeric(df[base].apply(parse_first_number), errors="coerce")/10000
+        else:
+            df["금액(억)"] = np.nan
+
+    # 보증금(억) / 월세(만)
+    if "보증금(억)" in df.columns:
+        df["보증금(억)"] = pd.to_numeric(df["보증금(억)"].apply(parse_first_number), errors="coerce")
+    else:
+        dep_col = next((c for c in ["보증금(만원)","보증금(만)"] if c in df.columns), None)
+        if dep_col:
+            df["보증금(억)"] = pd.to_numeric(df[dep_col].apply(parse_first_number), errors="coerce")/10000
+        else:
+            df["보증금(억)"] = np.nan
+
+    if "월세(만)" in df.columns:
+        df["월세(만)"] = pd.to_numeric(df["월세(만)"].apply(parse_first_number), errors="coerce")
+    else:
+        if "월세" in df.columns:
+            df["월세(만)"] = pd.to_numeric(df["월세"].apply(parse_first_number), errors="coerce")
+        else:
+            df["월세(만)"] = np.nan
+
+    # 평형/평형대 표준화(공백 제거)
+    df["평형"] = df["평형"].astype(str).str.strip()
+    df["평형대"] = df["평형대"].astype(str).str.replace(" ", "").str.strip()
+
+    # 구역/동 정리
+    def normalize_zone(z):
+        s = str(z).strip()
+        if s == "" or s.lower() == "nan": return ""
+        if s.isdigit(): return f"{int(s)}구역"
+        m = re.match(r"(\d+)\s*구역", s)
+        return f"{int(m.group(1))}구역" if m else s
+    df["구역"] = df["구역"].apply(normalize_zone)
+
+    try:
+        df["동"] = df["동"].apply(lambda x: str(int(float(str(x)))) if str(x).replace('.','',1).isdigit() else str(x))
+    except Exception:
+        df["동"] = df["동"].astype(str)
+
+    # 공개여부
+    if "공개여부" in df.columns:
+        df["공개여부_norm"] = df["공개여부"].astype(str).str.strip().str.lower().map(
+            {"y":"y","yes":"y","true":"y","1":"y","공개":"y"}).fillna("n")
+    else:
+        df["공개여부_norm"] = "y"
+
+    # 요약 기본값
+    df["요약내용"] = df["요약내용"].fillna("").apply(lambda x: "상태 보통" if str(x).strip()=="" else x)
+    return df
+
+@st.cache_data(ttl=60)
+def load_sheet(sheet_name: str, kind: str, nonce: int | None = None):
+    """kind: 'sale' or 'rent'"""
+    url = f"{CSV_BASE}&sheet={quote(sheet_name)}"
+    if nonce is not None:
+        url += f"&cacheBust={nonce}"  # 캐시 무력화
+    try:
+        df = pd.read_csv(url)
+        if kind == "sale":
+            return enrich_sale(df), f"csv:{sheet_name}"
+        else:
+            return enrich_rent(df), f"csv:{sheet_name}"
+    except Exception as e:
+        st.warning(f"{sheet_name} 시트를 CSV로 불러오지 못했습니다: {e}. 엑셀로 시도합니다.")
+
+    if EXCEL_PATH:
+        if not os.path.exists(EXCEL_PATH):
+            st.error(f"엑셀 파일을 찾을 수 없습니다: {EXCEL_PATH}"); st.stop()
+        try:
+            df = pd.read_excel(EXCEL_PATH, sheet_name=sheet_name)
+            if kind == "sale":
+                return enrich_sale(df), f"excel:{sheet_name}"
+            else:
+                return enrich_rent(df), f"excel:{sheet_name}"
+        except Exception as e:
+            st.error(f"엑셀 '{sheet_name}' 로드 실패: {e}"); st.stop()
+
+    st.error(f"데이터 소스를 찾을 수 없습니다. 시트 '{sheet_name}' 접근 권한/이름을 확인하세요."); st.stop()
+
+# ─────────────────────────────────────────────────────────
+# 3) 보기(모바일/데스크톱) + 최상위 구분(매매/임대) + 강제 새로고침
+# ─────────────────────────────────────────────────────────
+st.sidebar.header("보기 설정")
+view_mode = st.sidebar.selectbox("보기 모드", ["모바일(카드)", "데스크톱(테이블)"], index=0)
+page_size_label = st.sidebar.selectbox("표시 개수", ["전체", 25, 50, 100], index=0)
+
+if "refresh_nonce" not in st.session_state:
+    st.session_state["refresh_nonce"] = None
+if st.sidebar.button("🔄 시트 다시 읽기 / 캐시 비우기"):
+    st.cache_data.clear()
+    st.session_state["refresh_nonce"] = int(time.time())
+    st.experimental_rerun()
+
+if "dataset" not in st.session_state: st.session_state.dataset = None  # 'sale' or 'rent'
+if "mode" not in st.session_state: st.session_state.mode = None
+if "results_ready" not in st.session_state: st.session_state.results_ready = False
+if "page" not in st.session_state: st.session_state.page = 1
+
+def reset_all():
+    st.session_state.dataset = None
+    st.session_state.mode = None
+    st.session_state.results_ready = False
+    st.session_state.page = 1
+
+def pick_dataset(d):
+    st.session_state.dataset = d
+    st.session_state.mode = None
+    st.session_state.results_ready = False
+    st.session_state.page = 1
+
+def select_mode(m):
+    st.session_state.mode = m
+    st.session_state.results_ready = False
+    st.session_state.page = 1
+
+# 최상위 선택
+with st.container():
+    if st.session_state.dataset is None:
+        st.subheader("검색 대상을 선택하세요")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("🏷️ 매매물건 검색", use_container_width=True): pick_dataset("sale")
+        with c2:
+            if st.button("🧾 임대물건 검색", use_container_width=True): pick_dataset("rent")
+    else:
+        st.button("⬅️ 처음으로", on_click=reset_all)
+
+# 데이터 로드 (선택 후)
+nonce = st.session_state.get("refresh_nonce")
+if st.session_state.dataset == "sale":
+    df, source_kind = load_sheet(SALE_SHEET_NAME, "sale", nonce)
+elif st.session_state.dataset == "rent":
+    df, source_kind = load_sheet(RENT_SHEET_NAME, "rent", nonce)
+else:
+    st.stop()
+
+data = df[df["공개여부_norm"] == "y"].copy()
+
+# 데이터 진단
+with st.expander("🧪 데이터 진단(원본 확인)"):
+    st.write(f"소스: {source_kind} | 행수: {len(df):,}")
+    st.write("컬럼:", list(df.columns))
+    st.dataframe(df.head(15), use_container_width=True)
+
+# ─────────────────────────────────────────────────────────
+# 4) 단계형 네비 (두 번째 단계)
+# ─────────────────────────────────────────────────────────
+with st.container():
+    if st.session_state.mode is None:
+        if st.session_state.dataset == "sale":
+            st.subheader("검색 유형을 선택하세요 (매매)")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                if st.button("💰 금액대별 검색", use_container_width=True): select_mode("price_sale")
+            with c2:
+                if st.button("🗺️ 구역별 검색", use_container_width=True): select_mode("zone_sale")
+            with c3:
+                if st.button("📐 평형대별 검색", use_container_width=True): select_mode("pyeong_sale")
+        else:
+            st.subheader("검색 유형을 선택하세요 (임대)")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                if st.button("💵 금액별 검색(전세/보증금)", use_container_width=True): select_mode("amount_rent")
+            with c2:
+                if st.button("🗺️ 구역별 검색", use_container_width=True): select_mode("zone_rent")
+            with c3:
+                if st.button("📐 평형대별 검색", use_container_width=True): select_mode("pyeong_rent")
+
+# ─────────────────────────────────────────────────────────
+# 5) 출력 도구 (공통)
+# ─────────────────────────────────────────────────────────
+def paginate(dfv: pd.DataFrame):
+    if page_size_label == "전체":
+        return dfv, 1, 1
+    ps = int(page_size_label)
+    total = max(1, int(np.ceil(len(dfv)/ps)))
+    page = max(1, min(st.session_state.page, total))
+    start = (page-1)*ps
+    end = start + ps
+    return dfv.iloc[start:end], page, total
+
+def show_cards_sale(dfv: pd.DataFrame):
+    for _, r in dfv.iterrows():
+        title = f"**{r['구역']} · {r['평형']} · {r['동']}동 {r['층']}층**"
+        price = "—" if pd.isna(r["금액(억)"]) else f"**{float(r['금액(억)']):.1f}억**"
+        summary = str(r["요약내용"])
+        short = (summary[:40] + "…") if len(summary) > 40 else summary
+        st.markdown(f"{title}  \n{price} — {short}")
+        st.divider()
+
+def show_cards_rent(dfv: pd.DataFrame):
+    for _, r in dfv.iterrows():
+        title = f"**{r['구역']} · {r['평형']} · {r['동']}동 {r['층']}층**"
+        has_jeonse = not pd.isna(r.get("금액(억)", np.nan))
+        has_depo   = not pd.isna(r.get("보증금(억)", np.nan))
+        if has_jeonse:
+            price = f"**(전세)** {float(r['금액(억)']):.1f}(억)"
+        elif has_depo:
+            parts = [f"보증금 {float(r['보증금(억)']):.1f}(억)"]
+            wol = r.get("월세(만)", np.nan)
+            if not pd.isna(wol) and float(wol) != 0:
+                parts.append(f"월 {int(float(wol))}(만)")
+            price = f"**(월세)** " + " / ".join(parts)
+        else:
+            price = ""
+        summary = str(r["요약내용"])
+        short = (summary[:40] + "…") if len(summary) > 40 else summary
+        st.markdown(f"{title}  \n{price} — {short}")
+        st.divider()
+
+def show_table_sale(dfv: pd.DataFrame):
+    try:
+        st.dataframe(
+            dfv, use_container_width=True, hide_index=True,
+            column_config={
+                "평형대":  st.column_config.TextColumn("평형대",  width="small"),
+                "구역":    st.column_config.TextColumn("구역",    width="small"),
+                "평형":    st.column_config.TextColumn("평형",    width="small"),
+                "동":      st.column_config.TextColumn("동",      width="small"),
+                "층":      st.column_config.TextColumn("층",      width="small"),
+                "금액(억)": st.column_config.NumberColumn("금액(억)", width="small", format="%.1f"),
+                "요약내용": st.column_config.TextColumn("요약내용", width="medium", max_chars=60),
+            }
+        )
+    except Exception:
+        st.dataframe(dfv, use_container_width=True)
+
+def show_table_rent(dfv: pd.DataFrame):
+    dfv = dfv.copy()
+    dfv["전세금(표시)"] = dfv["금액(억)"].apply(lambda x: "" if pd.isna(x) else f"{float(x):.1f}(억)")
+    dfv["보증금(표시)"] = dfv["보증금(억)"].apply(lambda x: "" if pd.isna(x) else f"{float(x):.1f}(억)")
+    def fmt_wol(x):
+        if pd.isna(x) or float(x) == 0: return ""
+        try: return f"{int(float(x))}(만)"
+        except: return ""
+    dfv["월세(표시)"] = dfv["월세(만)"].apply(fmt_wol)
+    cols = ["평형대","구역","평형","동","층","전세금(표시)","보증금(표시)","월세(표시)","요약내용"]
+    try:
+        st.dataframe(
+            dfv[cols], use_container_width=True, hide_index=True,
+            column_config={
+                "평형대":  st.column_config.TextColumn("평형대",  width="small"),
+                "구역":    st.column_config.TextColumn("구역",    width="small"),
+                "평형":    st.column_config.TextColumn("평형",    width="small"),
+                "동":      st.column_config.TextColumn("동",      width="small"),
+                "층":      st.column_config.TextColumn("층",      width="small"),
+                "전세금(표시)": st.column_config.TextColumn("전세금", width="small"),
+                "보증금(표시)": st.column_config.TextColumn("보증금", width="small"),
+                "월세(표시)":   st.column_config.TextColumn("월세",   width="small"),
+                "요약내용": st.column_config.TextColumn("요약내용", width="medium", max_chars=60),
+            }
+        )
+    except Exception:
+        st.dataframe(dfv[cols], use_container_width=True)
+
+# ─────────────────────────────────────────────────────────────────
+# 6) 검색/필터 로직 — 평형대는 시트값 그대로 필터
+# ─────────────────────────────────────────────────────────────────
+SALE_DISPLAY = ["평형대","구역","평형","동","층","금액(억)","요약내용"]
+RENT_EXPORT  = ["평형대","구역","평형","동","층","금액(억)","보증금(억)","월세(만)","요약내용"]
+
+# 시트 표준 카테고리
+BAND_ORDER = ["20평형대","30평형대","40평형대","50평형대","60평형대","70평형대","80평형대"]
+
+out = pd.DataFrame()
+
+# 매매
+if st.session_state.mode == "price_sale":
+    st.subheader("💰 금액대별 검색 (매매)")
+    v = pd.to_numeric(data["금액(억)"], errors="coerce").dropna()
+    min_eok, max_eok = (0.0, 100.0) if v.empty else (float(np.floor(v.min())), float(np.ceil(v.max())))
+    c1, c2, c3 = st.columns([1,1,1])
+    with c1:
+        min_in = st.number_input("최소(억)", min_value=0.0, max_value=max_eok, value=min_eok, step=0.1, format="%.1f")
+    with c2:
+        max_in = st.number_input("최대(억)", min_value=min_in, max_value=max_eok, value=max_eok, step=0.1, format="%.1f")
+    with c3:
+        run = st.button("조회", type="primary", use_container_width=True)
+    if run:
+        q = data[pd.to_numeric(data["금액(억)"], errors="coerce").between(min_in, max_in)]
+        out = q[SALE_DISPLAY].copy()
+        out["금액(억)"] = pd.to_numeric(out["금액(억)"], errors="coerce")
+        out = out.sort_values(by="금액(억)", ascending=True, na_position="last")
+        st.session_state.results_ready = True
+
+elif st.session_state.mode == "zone_sale":
+    st.subheader("🗺️ 구역별 검색 (매매)")
+    zones = ["1구역","2구역","3구역","4구역","5구역","6구역"]
+    c1, c2 = st.columns([2,1])
+    with c1:
+        zone = st.selectbox("구역", zones, index=0)
+    with c2:
+        run = st.button("조회", type="primary", use_container_width=True)
+    if run:
+        q = data[data["구역"].astype(str) == zone]
+        out = q[SALE_DISPLAY].copy()
+        out["금액(억)"] = pd.to_numeric(out["금액(억)"], errors="coerce")
+        out = out.sort_values(by="금액(억)", ascending=True, na_position="last")
+        st.session_state.results_ready = True
+
+elif st.session_state.mode == "pyeong_sale":
+    st.subheader("📐 평형대별 검색 (매매)")
+    c1, c2 = st.columns([2,1])
+    with c1:
+        band = st.selectbox("평형대", BAND_ORDER, index=2)  # 40평형대 기본 선택 가능
+    with c2:
+        run = st.button("조회", type="primary", use_container_width=True)
+    if run:
+        q = data[data["평형대"].astype(str).str.replace(" ", "") == band]
+        out = q[SALE_DISPLAY].copy()
+        out["금액(억)"] = pd.to_numeric(out["금액(억)"], errors="coerce")
+        out = out.sort_values(by="금액(억)", ascending=True, na_position="last")
+        st.session_state.results_ready = True
+
+# 임대
+elif st.session_state.mode == "amount_rent":
+    st.subheader("💵 금액별 검색 (임대: 전세 ‘금액(억)’ + 월세 ‘보증금(억)’ 모두 포함)")
+    v_j = pd.to_numeric(data["금액(억)"], errors="coerce")
+    v_d = pd.to_numeric(data["보증금(억)"], errors="coerce")
+    base = pd.concat([v_j.dropna(), v_d.dropna()])
+    min_eok, max_eok = (0.0, 50.0) if base.empty else (float(np.floor(base.min())), float(np.ceil(base.max())))
+    c1, c2, c3 = st.columns([1,1,1])
+    with c1:
+        min_in = st.number_input("최소(억)", min_value=0.0, max_value=max_eok, value=min_eok, step=0.1, format="%.1f")
+    with c2:
+        max_in = st.number_input("최대(억)", min_value=min_in, max_value=max_eok, value=max_eok, step=0.1, format="%.1f")
+    with c3:
+        run = st.button("조회", type="primary", use_container_width=True)
+    if run:
+        m = (v_j.between(min_in, max_in, inclusive="both")) | (v_d.between(min_in, max_in, inclusive="both"))
+        q = data[m].copy()
+        # 정렬키: 전세금(억) 우선, 없으면 보증금(억)
+        sort_key = v_j.where(~v_j.isna(), v_d).loc[q.index]
+        q["_정렬액"] = sort_key
+        q["월세(만)"] = pd.to_numeric(q["월세(만)"], errors="coerce")
+        q = q.sort_values(by=["_정렬액","월세(만)"], ascending=[True, True], na_position="last")
+        out = q[RENT_EXPORT].copy()
+        st.session_state.results_ready = True
+
+elif st.session_state.mode == "zone_rent":
+    st.subheader("🗺️ 구역별 검색 (임대)")
+    zones = ["1구역","2구역","3구역","4구역","5구역","6구역"]
+    c1, c2 = st.columns([2,1])
+    with c1:
+        zone = st.selectbox("구역", zones, index=0)
+    with c2:
+        run = st.button("조회", type="primary", use_container_width=True)
+    if run:
+        q = data[data["구역"].astype(str) == zone].copy()
+        q["_정렬액"] = pd.to_numeric(q["금액(억)"], errors="coerce").where(
+            ~pd.to_numeric(q["금액(억)"], errors="coerce").isna(),
+            pd.to_numeric(q["보증금(억)"], errors="coerce")
+        )
+        q["월세(만)"] = pd.to_numeric(q["월세(만)"], errors="coerce")
+        q = q.sort_values(by=["_정렬액","월세(만)"], ascending=[True, True], na_position="last")
+        out = q[RENT_EXPORT].copy()
+        st.session_state.results_ready = True
+
+elif st.session_state.mode == "pyeong_rent":
+    st.subheader("📐 평형대별 검색 (임대)")
+    c1, c2 = st.columns([2,1])
+    with c1:
+        band = st.selectbox("평형대", BAND_ORDER, index=2)
+    with c2:
+        run = st.button("조회", type="primary", use_container_width=True)
+    if run:
+        q = data[data["평형대"].astype(str).str.replace(" ", "") == band].copy()
+        q["_정렬액"] = pd.to_numeric(q["금액(억)"], errors="coerce").where(
+            ~pd.to_numeric(q["금액(억)"], errors="coerce").isna(),
+            pd.to_numeric(q["보증금(억)"], errors="coerce")
+        )
+        q["월세(만)"] = pd.to_numeric(q["월세(만)"], errors="coerce")
+        q = q.sort_values(by=["_정렬액","월세(만)"], ascending=[True, True], na_position="last")
+        out = q[RENT_EXPORT].copy()
+        st.session_state.results_ready = True
+
+# ─────────────────────────────────────────────────────────
+# 7) 결과 출력 + 페이지 + 다운로드
+# ─────────────────────────────────────────────────────────
+st.markdown("---")
+st.caption(f"데이터 소스: {source_kind}")
+
+if st.session_state.results_ready:
+    st.markdown("### 📋 검색 결과")
+    st.caption(f"총 {len(out):,}건 (공개여부=Y)")
+    if len(out) == 0:
+        st.info("조건에 맞는 매물이 없습니다. 범위를 넓혀 다시 조회해 보세요.")
+    else:
+        # 페이지네이션
+        def _paginate(dfv: pd.DataFrame):
+            if page_size_label == "전체":
+                return dfv, 1, 1
+            ps = int(page_size_label)
+            total = max(1, int(np.ceil(len(dfv)/ps)))
+            page = max(1, min(st.session_state.page, total))
+            start = (page-1)*ps
+            end = start + ps
+            return dfv.iloc[start:end], page, total
+
+        view_df, cur, total = _paginate(out)
+
+        if st.session_state.dataset == "sale":
+            if view_mode.startswith("모바일"):
+                show_cards_sale(view_df)
+            else:
+                show_table_sale(view_df)
+        else:
+            if view_mode.startswith("모바일"):
+                show_cards_rent(view_df)
+            else:
+                show_table_rent(view_df)
+
+        if page_size_label != "전체" and total > 1:
+            colp1, colp2, colp3 = st.columns([1,1,1])
+            with colp1:
+                if st.button("⬅️ 이전", use_container_width=True) and st.session_state.page > 1:
+                    st.session_state.page -= 1
+                    st.experimental_rerun()
+            with colp2:
+                st.write(f"페이지 {cur} / {total}")
+            with colp3:
+                if st.button("다음 ➡️", use_container_width=True) and st.session_state.page < total:
+                    st.session_state.page += 1
+                    st.experimental_rerun()
+
+        # 다운로드
+        csv_bytes = out.to_csv(index=False).encode("utf-8-sig")
+        fname_prefix = "매매" if st.session_state.dataset == "sale" else "임대"
+        st.download_button(
+            "⬇️ 전체 결과 CSV 다운로드",
+            data=csv_bytes,
+            file_name=f"압구정동_{fname_prefix}_{st.session_state.mode}_검색_{datetime.now():%Y%m%d_%H%M}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
